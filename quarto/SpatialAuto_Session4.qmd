@@ -1,0 +1,493 @@
+---
+title: "Dealing with spatio-temporal autocorrelation"
+---
+
+Last edited on `r format(Sys.time(), "%a %b %d %X %Y")`
+
+```{r}
+#| include: false
+library(tidyverse)
+library(terra)
+library(sf)
+library(DHARMa)
+library(sdmTMB)
+library(lmtest)
+library(performance)
+library(modelbased)
+library(rnaturalearth)
+library(car)
+library(scales)
+```
+
+## What happens when you have both spatial AND temporal autocorrelation?
+
+So far, we've dealt with problems that consider only spatial autocorrelation. But autocorrelation can result from repeated measurements, also. How we deal with these situations is tricky and, to some extent, context dependent. Here, we'll work through an example that illustrates the sorts of things you should be thinking about when approaching this type of problem. But we'll caution you that other data sets will raise other sorts of problems.
+
+
+## Giant kelp and marine heatwave
+
+Our example is based on a slightly modified version of the data used in [Arafeh Dalmau et al. (2025) Marine heatwaves drive range contraction and alternative states of kelp forests at the warm limit of their distribution](https://www.biorxiv.org/content/10.1101/2025.10.17.682914v1.full). The study area comprises the distribution of giant-kelp forests along the Pacific coastline of Mexico, extending southwards from the US border to the southern distribution limit of giant kelp in the northern hemisphere at Punta Prieta. The region can be divided into two sub-regions: northern Baja California (32.53--29.73°N), characterized by relatively cooler upwelled waters; and the warmer central Baja California (29.73--27°N). 
+
+We focus on the 18-year period 2006--2023, inclusive, which is centred on a series of exceptional marine heatwaves during 2015--2016 (the phenomenon known as "The Blob"). We are interested in finding out whether the marine heatwaves (MHWs) impacted giant kelp populations and if so, whether any effects were consistent in northern and central Baja California.
+
+To answer this question, we collated time series of satellite-based estimates of kelp area, measured at 30-m grid resolution by three Landsat sensors, then aggregated estimates onto a 0.25º grid. This provides annual (`year`) estimates of kelp cover (`area`; ha) for each of 37 coastal 0.25º grid squares (`pixelid`, with coordinates `lon` and `lat`). Observations north of 29.73°N are classified as belonging to the "north" `region`, with the rest being "central", and observations from 2014 or earlier are considered to belong to the `period` "before" the MHWs started, with the rest being "after".
+
+Let's load up the packages we'll need in this session, retrieve the data for this analysis and plot the study area:
+
+```{r}
+#| eval: false
+library(tidyverse)
+library(terra)
+library(sf)
+library(DHARMa)
+library(sdmTMB)
+library(lmtest)
+library(performance)
+library(modelbased)
+library(rnaturalearth)
+library(car)
+library(scales)
+```
+
+```{r}
+#| warning: false
+# Get the data
+ df <- read_csv("data/blob_kelp.csv") %>% # Read in the data
+    filter(year == 2006) %>% # Get just the first year, so that we don't have replicated 0.25º grid squares
+    dplyr::select(pixelid, lon, lat, region) # Get just the coordinates of the 0.25º grid squares, and their identities
+
+# Build a land polygon
+  sf::sf_use_s2(FALSE) # Switches off the use of the Google S2 spherical geometry library within the sf package and reverts to using the GEOS library for geometric operations. 
+  bbox <- ext(-118, -112, 26.75, 33) # A rough bounding box for the study area
+  land <- ne_countries(scale = 50) %>% # A medium-resolution database of country polygons
+    st_crop(bbox) %>% # Cropped to our bounding box
+    st_geometry() # Retain only the geometries, not any of the other descriptors
+
+# Build a plot    
+  ggplot() + 
+    geom_sf(data = land, fill = "wheat") + # Plot the land and colour it in
+    geom_tile(data = df, aes(lon, lat, fill = region), # Add equal-sized tiles for the coordinates
+              alpha = .2, # Transparent
+              colour = "black", # With black outlines
+              show.legend = FALSE) + # No legend
+    geom_text(data = df, aes(lon, lat, label = pixelid), # Add pixelid labels
+              size = 2) + # Make them readable
+    geom_hline(yintercept = 29.72, # A horizontal line separating north and central regions
+               colour = "red", # Make it red
+               lty = "dashed") + # Make it dashed
+    scale_fill_manual(values = c("darkorange", "cadetblue4"), # Colour the grid squares by weatther they are in the northern or southern sub-region
+      na.value = "transparent") + # Set NAs to be transparent
+    labs(x = "", y = "") + # No x- or y-axis labels
+    theme(panel.background = element_rect(fill = "lightblue", color = NA)) + # Make the sea blue
+    ylim(c(27.05, 32.7)) + # Clip the figure to avoid polygon bounds being visible
+    xlim(c(-117.5, -112.5)) # Clip the figure to avoid polygon bounds being visible
+```
+We can see that some grid squares are contiguous with others, but there are also some fairly large spatial breaks among grid squares. We would therefore expect grid squares that are closer together to be more similar to each other than those that are far apart---i.e., we expect these data to contain some spatial autocorrelation. In this case, we won't consider these as aerial spatial data, but will rather use their centroids to define spatial associations. We've seen this before, and we know how to deal with it. But in this case, we *also* have observations from each grid square for consecutive years in a long sequence, which means that we also need to consider temporal autocorrelation.
+
+## Inspect the time series
+
+Let's start our analysis by just plotting the time series.
+
+```{r}
+dat <- read_csv("data/blob_kelp.csv") %>% 
+  mutate(across(where(is.character), factor), # Make character variables into factors
+         pixelid = factor(pixelid), # Convert this one manually, because it is a number, not a character
+         region = fct_relevel(region, "north"), # Make "north" the first factor level
+         period = fct_relevel(period, "before")) %>% # Make "before" the first factor level 
+  add_utm_columns(ll_names = c("lon", "lat")) # Add columns of UTM coordinates...we'll need this later
+
+col_pal <- c(c("cadetblue4", "darkorange")) # The same colour palette as we used in the map
+ggplot(dat) +
+  geom_line(aes(x = year, y = area, colour = region)) + # Plot the time series, coloured by region
+  geom_vline(xintercept = 2014.5, # A vertical line to indicate the separation of "before" and "after" the onset of the MHWs
+             linetype = "dashed",
+             colour = "red") +
+  labs(colour = "Region", # Sort out axis and legend labels
+       x = "",
+       y = "Areal coverage of kelp (ha)") +
+  scale_colour_manual(values = col_pal) + # Set the colour palette
+  facet_wrap(vars(pixelid)) + # Make a separate panel for each time series
+  theme(legend.position = "bottom", # Put legend at the bottom
+        axis.text.x = element_text(size = 5)) # Make x-axis text small enough to prevent overlap
+```
+
+We can see from this plot, we can see that there is a large amount of variation in kelp cover, both through time and among grid squares. Generally, there seems to be more kelp before the MHWs hit than after, with perhaps more of a persistent suppression of kelp in the central `region`, but it remains questionable whether this effect is statistically detectable, given the noise in the data.
+
+## Building the spatial mesh
+
+We'll be using `sdmTMB` again here, so we'll start by building our spatial mesh:
+
+```{r}
+mesh <- make_mesh(dat, xy_cols = c("X", "Y"), cutoff = 10)
+plot(mesh)
+```
+
+## A simple mixed-effects model without consideration of spatial or temporal autocorrelation
+
+Before we knew about autocorrelation, we might have started this analysis with a model of kelp `area` as a function of `region`, `period`, their interaction and a random grouping effect for `pixelid`. This model considers observations for each grid square to be fully independent of each other across time and space. Yes, we know that potentially introduces pseudoreplication (i.e., overestimating the number of degrees of freedom in the analysis), but let's start here, anyway, for the sake of illustration:
+
+```{r}
+m1 <- sdmTMB(area ~ region * period +
+               (1 | pixelid),
+             mesh = mesh,
+             spatial = "off",
+             data = dat,
+             family = tweedie())
+```
+
+Note that we have used the Tweedie distribution here, with its canonical log link function. The Tweedie distribution is extremely useful when your response data comprises only zeros and positive numbers, especially where the distribution of those response data might be skewed---so as an ecologist, it is very good to have the Tweedie distribution in your toolkit.
+
+Let's check the significance of the model terms:
+
+```{r}
+#| warning: false
+Anova(m1)
+```
+
+It seems as if all terms are highly significant, so there is an effect of both `region` and `period`, with the effect of `period` depending on the `region` considered.
+
+We can illustrate this with a plot:
+
+```{r}
+# Build a prediction tibble
+  new_dat <- expand_grid(region = levels(dat$region),
+                         period = levels(dat$period), # A tibble with two variables containing all possible combinations of region and period 
+                         year = min(dat$year)) # We'll add a single value for year, here, even though we're not using it yet
+
+# Predict values from our model for this prediction tibble
+  preds1 <- estimate_expectation(m1, new_dat) %>% 
+    tibble()
+
+# Plot the results
+  ggplot() +
+    geom_errorbar(data = preds1,
+                  aes(x = period, ymin = CI_low, ymax = CI_high, colour = region),
+                  width = .05,
+                  linewidth = 1,
+                  position = position_dodge(.3)) +
+    geom_point(data = preds1,
+               aes(x = period, y = Predicted, colour = region),
+               position = position_dodge(.3),
+               size = 3) +
+    labs(colour = "Region",
+         y = "Areal coverage of kelp ± 95% confidence (ha)",
+         x = "Timing relative to the onset of MHWs") +
+    scale_colour_manual(values = col_pal)
+```
+
+This result suggests that there are strongly significant differences in kelp coverage for each combination of `period` and `region`, with clear indications that there is less kelp in central regions and that kelp coverage declined sharply with the onset of MHWs, perhaps more so (in absolute terms) in the northern than in the central "region`.
+
+What do the model diagnostics look like?
+
+```{r}
+# A function for plotting residuals from sdmTMB models
+sdmTMB_residuals <- function(model, nsim = 1000, plot = TRUE) {
+  set.seed(123456) # Set the random seed so that we get the same results for randomisations
+  sims <- simulate({{model}}, nsim = nsim, type = "mle-mvn") # We can't use DHARMa residuals "As is" with sdmTMB
+  res <- dharma_residuals({{model}}, simulated_response = sims, integerResponse = TRUE, return_DHARMa = TRUE)
+  if(plot != TRUE) {
+    return(res)
+    } else {
+      plot(res)
+      }
+  }
+
+# Deploy the function
+sdmTMB_residuals(m1)
+```
+These diagnostics aren't terrible, although there are some indications that residuals are not homoscedastic.
+
+But are our observations really independent---i.e., are we missing any autocorrelation?
+
+## Adding spatial autocorrelation
+
+Since we anticipate that kelp cover in grid squares closer to each other would be more similar than would be the case among distant grid squares, let's account for spatial autocorrelation in our model:
+
+
+```{r}
+#| cache: true
+#| warning: false
+m2 <- sdmTMB(area ~ region * period,
+             mesh = mesh,
+             spatial = "on", # Switch on the random spatial mesh
+             data = dat,
+             family = tweedie())
+Anova(m2)
+```
+
+It seems as if all terms remain highly significant.
+
+Let's plot the predictions:
+
+```{r}
+# Predict values from our model for this prediction tibble
+  preds2 <- estimate_expectation(m2, new_dat) %>% 
+    tibble()
+
+# Plot the results
+  ggplot(preds2) +
+    geom_errorbar(aes(x = period, ymin = CI_low, ymax = CI_high, colour = region),
+                  width = .05,
+                  linewidth = 1,
+                  position = position_dodge(.3)) +
+    geom_point(aes(x = period, y = Predicted, colour = region),
+               position = position_dodge(.3),
+               size = 3) +
+    labs(colour = "Region",
+         y = "Areal coverage of kelp ± 95% confidence (ha)",
+         x = "Timing relative to the onset of MHWs") +
+    scale_colour_manual(values = col_pal)
+```
+
+The results look quite similar, so let's check the diagnostics:
+
+```{r}
+sdmTMB_residuals(m2)
+```
+These diagnostics aren't much different from those for our simpler model. But they're still not great. Perhaps adding temporal autocorrelation will help?
+
+## A model with both spatial and temporal autocorrelation
+
+### Let's start with temporal autocorrelation as AR1
+
+For time series that are stationary---i.e., time series that fluctuate around some long-term mean, rather than following some long-term trend---we generally specify temporal autocorrelation as autoregressive, often of order 1 ("AR1"). This form of autocorrelation assumes a "memory" (dependence) that goes no further back than the previous observation.
+
+Let's check our time series for the presence of significant temporal autocorrelation at lag 1. The simplest way is with the Durbin-Watson test:
+
+```{r}
+# Run a Durbin-Watson test for each time series, each time extracting just the p-value from the test
+dat %>% 
+  arrange(year) %>%  # Sort by year to ensure that the data are ordered in time
+  group_by(pixelid) %>% # Group by pixel to ensure that we work one time series at a time
+  summarise(p = dwtest(area ~ 1) %>% pluck("p.value")) %>% # For each time series, run the test and extract the p-value
+  mutate(significance = ifelse(p <= 0.05, "***significant***", "non-significant")) %>% # Make a new column to make it easier to spot significant results
+  print(n = nrow(.)) # Print all rows
+```
+
+It seems like there is significant AR1 temporal autocorrelation in almost half of the time series. So let's try to account for it.
+
+```{r}
+#| cache: true
+#| warning: false
+m3 <- sdmTMB(area ~ region * period +
+             (1 | pixelid),
+             mesh = mesh,
+             spatial = "on",
+             time = "year", # Specify that year controls for time
+             spatiotemporal = "ar1", # Specify autoregressive correlation of order 1
+             data = dat,
+             family = tweedie())
+Anova(m3)
+```
+
+All model terms remain significant. But what about the residuals?
+
+```{r}
+sdmTMB_residuals(m3)
+```
+
+These residuals are a substantial improvement. The QQ plot is pretty neat, and there are some indications of the trends for residuals at the three quartiles to flatten somewhat across the centre of the range of predictions---OK, they're not flat, and those for the thrid quartile are still increasing steeply, but "better" is better, not perfect.
+
+Let's plot the result for the sake of comparison:
+
+```{r}
+# Predict values from our model for this prediction tibble
+  preds3 <- estimate_expectation(m3, new_dat) %>% 
+    tibble()
+
+# Plot the results
+  ggplot(preds3) +
+    geom_errorbar(aes(x = period, ymin = CI_low, ymax = CI_high, colour = region),
+                  width = .05,
+                  linewidth = 1,
+                  position = position_dodge(.3)) +
+    geom_point(aes(x = period, y = Predicted, colour = region),
+               position = position_dodge(.3),
+               size = 3) +
+    labs(colour = "Region",
+         y = "Areal coverage of kelp ± 95% confidence (ha)",
+         x = "Timing relative to the onset of MHWs") +
+    scale_colour_manual(values = col_pal)
+```
+
+Now that we have accounted for potential correlation among observations within each time series, the error bars have spread considerably. This is a clear indication that estimation is now based on fewer degrees of freedom---which is what we wanted the routine to do, because there are fewer truly independent observations in each time series. 
+
+On the basis of this plot, it seems like there is little difference in kelp cover between regions before the initiation of MHWs, that kelp cover declines in both subregions after the initiation of MHWs, and that there is less kelp in central than the northern region after the MHWs.
+
+But our original plot of time series didn't suggest that they were stationary, so would some other form of temporal autocorrelation do better?
+
+### Temporal autocorrelation as a random walk
+
+Where the data has "memory" (dependence) but little clear tendency to return to a fixed central value, it can be more appropriate to model temporal autocorrelation as a random walk. So let's give that a crack:
+
+```{r}
+#| cache: true
+#| warning: false
+m4 <- sdmTMB(area ~ region * period +
+               (1 | pixelid),
+             mesh = mesh,
+             spatial = "on",
+             time = "year", # Specify that year controls for time
+             spatiotemporal = "rw", # Specify random walk for temporal autocorrelation
+             data = dat,
+             family = tweedie())
+Anova(m4)
+```
+We're starting to see a shift in the significance of model terms, now. But remember that we shouldn't be interpreting main effects when a significant interaction is present. So let's plot the output and interpret that, instead.
+
+```{r}
+# Predict values from our model for this prediction tibble
+  preds4 <- estimate_expectation(m4, new_dat) %>% 
+    tibble()
+
+# Plot the results
+  ggplot(preds4) +
+    geom_errorbar(aes(x = period, ymin = CI_low, ymax = CI_high, colour = region),
+                  width = .05,
+                  linewidth = 1,
+                  position = position_dodge(.3)) +
+    geom_point(aes(x = period, y = Predicted, colour = region),
+               position = position_dodge(.3),
+               size = 3) +
+    labs(colour = "Region",
+         y = "Areal coverage of kelp ± 95% confidence (ha)",
+         x = "Timing relative to the onset of MHWs") +
+    scale_colour_manual(values = col_pal)
+```
+It seems as if the confidence bands are a little tighter, but that overall interpretation isn't much different.
+
+What about the diagnostics?
+
+```{r}
+sdmTMB_residuals(m4)
+```
+
+These are pretty good. Specifically, we can see further "flattening" of the curves fitted to the quantiles of the residuals. Yes, there seems to be an issue with over-estimating large values, but for most of the observations, this result is pretty good.
+
+Which model is best?
+
+```{r}
+compare_performance(m1, m2, m3, m4)
+```
+It seems as if our model with random walk temporal autocorrelation is preferred, both in terms of AIC and BIC. Since the residuals for this model are also better than for any of our previous candidate models, we'll stop here.
+
+### A last check of the residuals using the partial autocorrelation function
+
+The Partial Autocorrelation Function (`pacf`) measures the direct correlation between a time series and versions of itself at increasing lags, without the influence of intermediate lags. We're looking for significant autocorrelations (bars that extend beyond the horizontal dashed red lines) and, specifically, consistent patterns in these significant autocorrelations.
+
+To make it easier to repeat these plots, we build a plotting function, then deploy it:
+
+```{r}
+plot_pacf_by_group <- function(model, data, time_var, grouping_var) {
+df <- data %>% 
+  mutate(residuals = sdmTMB_residuals(model, plot = FALSE) %>% 
+           pluck("scaledResiduals")) %>%  # Append the residuals from the model to the data
+  arrange({{time_var}}) %>% 
+  group_by({{grouping_var}}) %>% # Group by pixelid (i.e., by time series)
+  summarise(PACF = list(pacf(residuals, plot = FALSE) %>% # For each time series, extract the pacf stats
+                          pluck("acf")), # Retaining ONLY the autocorrelation function values
+            n = n()) %>% # Compute the number of observations by group
+  unnest(cols = PACF) %>%  # Spread the nested tibbles created from the summarise function
+  group_by({{grouping_var}}) %>% 
+  mutate(lag = row_number()) %>% # Add lags by group
+  ungroup()
+ggplot() +
+  geom_col(data = df, # Column graphs
+           aes(x = lag, y = PACF),  # pacf by lag
+           fill = "skyblue") +
+  facet_wrap(vars({{grouping_var}})) + # Creates separate panels for each ID
+  geom_hline(yintercept = 0) + # Horizontal line at zero (i.e., no autocorrelation)
+  geom_hline(yintercept = c(1.96, -1.96)/df %>% pull(n) %>% min() %>% sqrt(), color = "red", linetype = "dashed") + # Approx confidence limits
+  labs(x = "Lag", y = "Partial Autocorrelation") +
+  scale_x_continuous(breaks = breaks_width(2)) +
+  theme(axis.text = element_text(size = 5)) # Make x-axis text small enough to prevent overlap
+  }  
+  
+plot_pacf_by_group(model = m4, 
+                   data = dat, 
+                   time_var = year, 
+                   grouping_var = pixelid)
+```
+
+There are relatively few significant autocorrelations in the individual time series, and no discernible patterns, so although our model has not entirely eliminated all traces of autocorrelation, it seems to have done a reasonable job.
+
+We can use a Durbin-Watson test to confirm that few time series or model residuals retain significant autocorrelation at lag 1:
+
+```{r}
+dat %>% 
+  mutate(residuals = sdmTMB_residuals(m4, plot = FALSE) %>% 
+           pluck("scaledResiduals")) %>% 
+  group_by(pixelid) %>% 
+  summarise(p = dwtest(residuals ~ 1) %>% pluck("p.value")) %>%
+  mutate(significance_p = ifelse(p <= 0.05, "***significant***", "non-significant")) %>% 
+  print(n = nrow(.))
+```
+
+The residuals of only 3 time series retain autocorrelation at lag 1 (proibably none, if you adjust for multiple comparisons), which is a good sign. It seems as if we've done about as well as we can.
+
+## Take-aways
+
+Modelling spatial and temporal autocorrelation sounds difficult, and it *can* be tricky, but we have reasonably simple tools that we can help. Of course, when things get messy, as they often do in ecology, we need to dig deeper, but hopefully this brief overview is enough to prepare you for that ordeal 😉.
+
+### R books and web material
+
+There are plenty of good books out there (too many to choose from in
+fact). For the content we covered today, some good resources are:
+
+-   [R for Data Science](https://r4ds.had.co.nz/){target="_blank"}, for
+    data wrangling mainly
+
+-   [R Graphics
+    Cookbook](http://www.cookbook-r.com/Graphs/){target="_blank"}, for
+    `ggplot` and free on the web
+
+-   [Spatial Data
+    Science](https://r-spatial.org/book/){target="_blank"}, for `sf` and
+    more
+
+-   [Geocomputation in
+    R](https://geocompr.robinlovelace.net/){target="_blank"}, free on
+    the web
+
+-   [Spatial Statistics for Data
+    Science](https://www.paulamoraga.com/book-spatial/index.html){target="_blank"},
+    for spatial statistics
+
+-   The classic text for GAMs is [Generalized Additive Models: An
+    Introduction with
+    R](https://www.routledge.com/Generalized-Additive-Models-An-Introduction-with-R-Second-Edition/Wood/p/book/9781498728331){target="_blank"}.
+    This has a very technical treatment of GAMs, but also an extensive
+    section with practical examples, including spatial ones.
+
+-   If you want to learn new tricks, or stay up-to-date with the latest
+    packages, the blog aggregator
+    [R-Bloggers](https://www.r-bloggers.com/){target="_blank"} has a
+    non-step feed of R blogs from all over the world and all
+    disciplines, including [Nicholas Clark's
+    blog](https://ecogambler.netlify.app/blog/){target="_blank"}, [Chris
+    Brown's
+    blog](http://www.seascapemodels.org/bluecology_blog.html){target="_blank"}
+    and [Gavin Simpson's
+    blog](https://fromthebottomoftheheap.net/){target="_blank"}
+
+If you prefer to have a printed guide, another tactic is to web search
+your favourite package and "cheatsheet".
+
+## Session Info
+
+```{r}
+#| class-output: "scroll-300"
+sessionInfo()
+```
+
+```{r}
+#| echo: false
+#| results: hide
+#| eval: true
+#| message: false
+knitr::purl("SpatialAuto_Session4.qmd", documentation = 0, output = "CodeFromNotes/SpatialAuto_Session4.R")
+
+unlink(list.files("Output", full.names = TRUE, recursive = TRUE), recursive = TRUE)
+```
+
+
