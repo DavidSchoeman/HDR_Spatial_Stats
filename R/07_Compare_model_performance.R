@@ -14,6 +14,7 @@ pacman::p_load(
 
 # Compare models ----------------------------------------------------------
 
+  dat <- read_rds("output/df_spatial.rds")
   m1 <- read_rds("output/m1.rds")
   m2 <- read_rds("output/m2.rds")
   m3 <- read_rds("output/m3.rds")

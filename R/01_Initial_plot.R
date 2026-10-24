@@ -5,19 +5,19 @@
 
 # Attach package libraries ------------------------------------------------
 
-pacman::p_load(
-  tidyverse,
-  terra,
-  sf, 
-  rnaturalearth
-  )
+  pacman::p_load(
+    tidyverse,
+    terra,
+    sf, 
+    rnaturalearth
+    )
 
 
 # Get the data to plot ---------------------------------------------------
 
-df <- read_csv("Data/blob_kelp.csv") %>% # Read in the data
-  filter(year == 2006) %>% # Get just the first year, so that we don't have replicated 0.25º grid squares
-  dplyr::select(pixelid, lon, lat, region)  # Get just the coordinates of the 0.25º grid squares, and their identities
+  df <- read_csv("Data/blob_kelp.csv") %>% # Read in the data
+    filter(year == 2006) %>% # Get just the first year, so that we don't have replicated 0.25º grid squares
+    dplyr::select(pixelid, lon, lat, region)  # Get just the coordinates of the 0.25º grid squares, and their identities
 
 
 # Produce the plot ----------------------------------------------------------

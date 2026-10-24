@@ -2,7 +2,7 @@
 
 This is a series of scripts that fits increasingly complex models considering spatial and temporal autocorrelation.
 
-# Scripts -- In the `R` direcory
+# Scripts -- In the `R` directory
 
 - `01 Initial plot.R`: Produces Figure 1, an initial plot of the study area.
 

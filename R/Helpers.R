@@ -10,7 +10,12 @@
 
 
 # A function for plotting residuals from sdmTMB models --------------------
-
+  
+  pacman::p_load(
+    sdmTMB,
+    DHARMA,
+    scales
+  )
   sdmTMB_residuals <- function(model, nsim = 1000, plot = TRUE) {
     set.seed(123456) # Set the random seed so that we get the same results for randomisations
     sims <- simulate({{model}}, nsim = nsim, type = "mle-mvn") # We can't use DHARMa residuals "As is" with sdmTMB
